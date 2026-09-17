@@ -1,0 +1,4 @@
+interface:
+  display_name: "OCR Enhanced Code Review"
+  short_description: "Use OCR deterministic selection and rules with Codex validation"
+  default_prompt: "Use $ocr-enhanced-code-review to review the requested scope with OCR preflight and Codex verification; use current changes by default and full-file scan when requested."
