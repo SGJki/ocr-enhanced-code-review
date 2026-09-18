@@ -8,6 +8,7 @@ dependencies = []
 [dependency-groups]
 validation = [
   "pyyaml>=6.0,<7",
+  "pytest>=8,<9",
   "ruff>=0.16.8,<0.17",
 ]
 

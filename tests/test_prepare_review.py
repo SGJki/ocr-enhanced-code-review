@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts import prepare_review
+from skill.scripts import prepare_review
 
 
 class PrepareReviewTests(unittest.TestCase):
@@ -50,7 +50,7 @@ class PrepareReviewTests(unittest.TestCase):
         )
         self.assertEqual(batches, [["a.py"], ["b.py"], ["c.py"]])
 
-    @patch("scripts.prepare_review.subprocess.run")
+    @patch("skill.scripts.prepare_review.subprocess.run")
     def test_run_json_reports_timeout(self, run: unittest.mock.Mock) -> None:
         run.side_effect = subprocess.TimeoutExpired(["ocr"], timeout=5)
         with self.assertRaisesRegex(RuntimeError, "timed out after 5s"):
