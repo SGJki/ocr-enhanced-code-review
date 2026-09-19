@@ -371,7 +371,7 @@ Plan 解析失败时，脚本记录 warning 并继续主审查，但不能把未
 - 比较启用/禁用 plan 与验证的 token、延迟、finding precision；
 - 为 prompt packet 和最终输出增加版本字段，支持回溯。
 
-当前实现对应关系：`prepare_review.py --packets` 输出 schema-2 manifest 和按 rule group 的 packet；`changed_lines_from_diff`、`validate_manifest`、`normalize_findings`、`validation_queue` 和 `apply_validation_decision` 分别覆盖变更定位、旧版本兼容、finding 确定性清理、选择性验证门控和不确定结果保留。LLM 调用本身仍由宿主 Codex 编排，不由 helper 发起。
+当前实现对应关系：`prepare_review.py --packets` 输出 schema-2 manifest 和按 rule group 的 packet，并通过 `--packet-max-bytes` 对超大 group 或单文件 diff 进行确定性分片；`changed_lines_from_diff`、`validate_manifest`、`normalize_findings`、`validation_queue` 和 `apply_validation_decision` 分别覆盖变更定位、旧版本兼容、finding 确定性清理、选择性验证门控和不确定结果保留。LLM 调用本身仍由宿主 Codex 编排，不由 helper 发起。
 
 ## 14. 测试与验收标准
 

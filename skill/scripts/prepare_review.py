@@ -18,6 +18,7 @@ DEFAULT_COMMAND_TIMEOUT_SECONDS = 300
 MAX_RULE_COMMAND_BYTES = 64 * 1024
 DEFAULT_PLAN_CHANGED_LINES = 80
 DEFAULT_PLAN_FILES = 4
+DEFAULT_PACKET_MAX_BYTES = 128 * 1024
 MAX_FINDING_TEXT = 20_000
 FINDING_SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 FINDING_CATEGORIES = {
@@ -216,6 +217,20 @@ def _scope_diff(repo: Path, selection: dict[str, Any]) -> str:
         )
     if mode == "scan":
         return ""
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"failed to inspect git HEAD in {repo}: {exc}") from exc
+    if head.returncode != 0:
+        # In an unborn repository every OCR-selected file is new. Returning an
+        # empty tracked diff lets _file_diff_map synthesize those file diffs.
+        return ""
     return _run_git(repo, ["diff", "--no-ext-diff", "--unified=3", "HEAD"])
 
 
@@ -293,12 +308,163 @@ def plan_required(
     )
 
 
+def _json_size(value: dict[str, Any]) -> int:
+    """Measure the readable JSON form emitted to the review packet."""
+    return len(json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8"))
+
+
+def _split_text_by_bytes(value: str, max_bytes: int) -> list[str]:
+    chunks: list[str] = []
+    current: list[str] = []
+    current_bytes = 0
+    for character in value:
+        character_bytes = len(character.encode("utf-8"))
+        if current and current_bytes + character_bytes > max_bytes:
+            chunks.append("".join(current))
+            current = []
+            current_bytes = 0
+        current.append(character)
+        current_bytes += character_bytes
+    if current or not chunks:
+        chunks.append("".join(current))
+    return chunks
+
+
+def _diff_segments(diff: str, max_bytes: int) -> list[tuple[str, set[int]]]:
+    """Split a diff while retaining the changed lines represented by each part."""
+    records: list[tuple[str, int | None]] = []
+    new_line: int | None = None
+    for line in diff.splitlines(keepends=True):
+        match = HUNK_RE.match(line)
+        if match:
+            new_line = int(match.group(1))
+            records.append((line, None))
+            continue
+        changed_line: int | None = None
+        if new_line is not None and line.startswith("+") and not line.startswith("+++"):
+            changed_line = new_line
+            new_line += 1
+        elif new_line is not None and line.startswith(" "):
+            new_line += 1
+        for part in _split_text_by_bytes(line, max_bytes):
+            records.append((part, changed_line))
+
+    segments: list[tuple[str, set[int]]] = []
+    text: list[str] = []
+    lines: set[int] = set()
+    size = 0
+    for value, changed_line in records:
+        value_size = len(value.encode("utf-8"))
+        if text and size + value_size > max_bytes:
+            segments.append(("".join(text), lines))
+            text = []
+            lines = set()
+            size = 0
+        text.append(value)
+        size += value_size
+        if changed_line is not None:
+            lines.add(changed_line)
+    if text or not segments:
+        segments.append(("".join(text), lines))
+    return segments
+
+
+def _packet_template(
+    group: dict[str, Any],
+    index: int,
+    group_paths: list[str],
+    background: Any,
+    required_plan: bool,
+) -> dict[str, Any]:
+    group_id = group.get("group_id", index)
+    return {
+        "packet_id": f"group-{group_id}-part-999999",
+        "group_id": group_id,
+        "part_index": 999999,
+        "part_count": 999999,
+        "review_files": group_paths,
+        "files": [],
+        "rule": group.get("rule", ""),
+        "background": background,
+        "plan_required": required_plan,
+    }
+
+
+def _group_packets(
+    group: dict[str, Any],
+    index: int,
+    group_paths: list[str],
+    diffs: dict[str, str],
+    changed: dict[str, set[int]],
+    background: Any,
+    required_plan: bool,
+    max_packet_bytes: int,
+) -> list[dict[str, Any]]:
+    template = _packet_template(group, index, group_paths, background, required_plan)
+    base_size = _json_size(template)
+    if base_size >= max_packet_bytes:
+        raise OCRResponseError(
+            "packet byte budget is too small for rule and group metadata: "
+            f"group={group.get('group_id', index)}, minimum>{base_size}"
+        )
+
+    # JSON escaping can roughly double diff size. The extra factor leaves room
+    # for path and segment metadata while keeping the final hard-size check.
+    diff_budget = max(1, (max_packet_bytes - base_size) // 3)
+    entries: list[dict[str, Any]] = []
+    for path in group_paths:
+        segments = _diff_segments(diffs[path], diff_budget)
+        represented = set().union(*(lines for _, lines in segments))
+        missing = changed[path] - represented
+        for segment_index, (segment, segment_lines) in enumerate(segments, start=1):
+            entries.append(
+                {
+                    "path": path,
+                    "diff": segment,
+                    "changed_lines": sorted(
+                        segment_lines | (missing if segment_index == 1 else set())
+                    ),
+                    "segment_index": segment_index,
+                    "segment_count": len(segments),
+                }
+            )
+
+    packets: list[dict[str, Any]] = []
+    current = dict(template)
+    current["files"] = []
+    for entry in entries:
+        candidate = dict(current)
+        candidate["files"] = [*current["files"], entry]
+        if current["files"] and _json_size(candidate) > max_packet_bytes:
+            packets.append(current)
+            current = dict(template)
+            current["files"] = [entry]
+        else:
+            current = candidate
+        if _json_size(current) > max_packet_bytes:
+            raise OCRResponseError(
+                "packet entry exceeds byte budget after deterministic splitting: "
+                f"group={group.get('group_id', index)}, path={entry['path']}"
+            )
+    if current["files"]:
+        packets.append(current)
+
+    part_count = len(packets)
+    for part_index, packet in enumerate(packets, start=1):
+        packet["packet_id"] = f"group-{packet['group_id']}-part-{part_index}"
+        packet["part_index"] = part_index
+        packet["part_count"] = part_count
+        packet["plan_required"] = required_plan or part_count > 1
+    return packets
+
+
 def build_review_packets(
     manifest: dict[str, Any],
     repo: Path,
     *,
     max_plan_lines: int = DEFAULT_PLAN_CHANGED_LINES,
     max_plan_files: int = DEFAULT_PLAN_FILES,
+    max_packet_bytes: int = DEFAULT_PACKET_MAX_BYTES,
 ) -> list[dict[str, Any]]:
     """Build stable, group-scoped packets from an OCR manifest."""
     validate_manifest(manifest)
@@ -314,26 +480,20 @@ def build_review_packets(
         group_paths = group.get("files")
         if not isinstance(group_paths, list):
             raise OCRResponseError(f"rule group {index} has invalid files")
-        packet_files = []
-        for path in sorted(group_paths):
-            packet_files.append(
-                {
-                    "path": path,
-                    "diff": diffs[path],
-                    "changed_lines": sorted(changed[path]),
-                }
-            )
-        packets.append(
-            {
-                "packet_id": f"group-{group.get('group_id', index)}",
-                "group_id": group.get("group_id", index),
-                "files": packet_files,
-                "rule": group.get("rule", ""),
-                "background": selection.get("background") or manifest.get("background"),
-                "plan_required": plan_required(
+        sorted_group_paths = sorted(group_paths)
+        packets.extend(
+            _group_packets(
+                group,
+                index,
+                sorted_group_paths,
+                diffs,
+                changed,
+                selection.get("background") or manifest.get("background"),
+                plan_required(
                     group, changed, max_lines=max_plan_lines, max_files=max_plan_files
                 ),
-            }
+                max_packet_bytes,
+            )
         )
     return packets
 
@@ -411,8 +571,8 @@ def validate_finding(
     anchor = finding.get("anchor")
     if (
         not isinstance(anchor, dict)
-        or not isinstance(anchor.get("start_line"), int)
-        or not isinstance(anchor.get("end_line"), int)
+        or type(anchor.get("start_line")) is not int
+        or type(anchor.get("end_line")) is not int
     ):
         errors.append("anchor requires integer start_line and end_line")
     elif anchor["start_line"] <= 0 or anchor["end_line"] < anchor["start_line"]:
@@ -606,6 +766,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_PLAN_FILES,
         help="File-count threshold that marks a group as plan_required",
     )
+    parser.add_argument(
+        "--packet-max-bytes",
+        type=positive_int,
+        default=DEFAULT_PACKET_MAX_BYTES,
+        help="Maximum serialized bytes for each review packet",
+    )
     return parser
 
 
@@ -717,6 +883,7 @@ def main() -> int:
                 repo,
                 max_plan_lines=args.plan_lines,
                 max_plan_files=args.plan_files,
+                max_packet_bytes=args.packet_max_bytes,
             )
         json.dump(manifest, sys.stdout, ensure_ascii=False, indent=2)
         sys.stdout.write("\n")

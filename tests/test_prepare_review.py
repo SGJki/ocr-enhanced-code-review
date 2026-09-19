@@ -99,6 +99,58 @@ class PrepareReviewTests(unittest.TestCase):
         self.assertTrue(packets[0]["plan_required"])
         self.assertEqual(packets[0]["files"][0]["changed_lines"], [1])
 
+    def test_workspace_without_head_synthesizes_selected_file_diff(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(
+                prepare_review.subprocess,
+                "run",
+                return_value=unittest.mock.Mock(returncode=1),
+            ),
+        ):
+            repo = Path(directory)
+            (repo / "a.py").write_text("print(1)\n", encoding="utf-8")
+            diffs, changed = prepare_review._file_diff_map(
+                repo, {"mode": "workspace"}, ["a.py"]
+            )
+
+        self.assertIn("+++ b/a.py", diffs["a.py"])
+        self.assertEqual(changed["a.py"], {1})
+
+    def test_review_packets_split_to_respect_byte_budget(self) -> None:
+        manifest = {
+            "schema_version": "2",
+            "selection": {"reviewable_files": [{"path": "a.py"}]},
+            "rule_groups": [{"group_id": 1, "files": ["a.py"], "rule": "Correctness"}],
+        }
+        diff = "--- a/a.py\n+++ b/a.py\n@@ -0,0 +1,100 @@\n" + "".join(
+            f"+value_{index} = {index}\n" for index in range(1, 101)
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(
+                prepare_review,
+                "_file_diff_map",
+                return_value=({"a.py": diff}, {"a.py": set(range(1, 101))}),
+            ),
+        ):
+            packets = prepare_review.build_review_packets(
+                manifest, Path(directory), max_packet_bytes=700
+            )
+
+        self.assertGreater(len(packets), 1)
+        self.assertTrue(
+            all(prepare_review._json_size(packet) <= 700 for packet in packets)
+        )
+        self.assertTrue(all(packet["review_files"] == ["a.py"] for packet in packets))
+        represented = {
+            line
+            for packet in packets
+            for file in packet["files"]
+            for line in file["changed_lines"]
+        }
+        self.assertEqual(represented, set(range(1, 101)))
+
     def test_normalize_findings_rejects_scope_and_changed_line_violations(self) -> None:
         finding = {
             "path": "other.py",
@@ -116,6 +168,23 @@ class PrepareReviewTests(unittest.TestCase):
         )
         self.assertEqual(valid, [])
         self.assertIn("path is outside selected review set", rejected[0]["errors"])
+
+    def test_finding_anchor_rejects_boolean_line_numbers(self) -> None:
+        finding = {
+            "path": "a.py",
+            "anchor": {"start_line": True, "end_line": True},
+            "severity": "high",
+            "category": "bug",
+            "claim": "broken",
+            "evidence": "evidence",
+            "impact": "impact",
+            "fix": "fix",
+            "confidence": "high",
+        }
+        self.assertIn(
+            "anchor requires integer start_line and end_line",
+            prepare_review.validate_finding(finding, {"a.py"}, {"a.py": {1}}),
+        )
 
     def test_normalize_findings_deduplicates_and_sorts_by_severity(self) -> None:
         base = {
